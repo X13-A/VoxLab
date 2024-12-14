@@ -279,6 +279,7 @@ Shader "Custom/WorldPostProcess"
                 float4 color;
                 float depth;
                 float3 normal;
+                float density;
             };
 
             rayMarchInfo newRayMarchInfo()
@@ -289,6 +290,7 @@ Shader "Custom/WorldPostProcess"
                 info.pos = float3(0, 0, 0);
                 info.depth = 0;
                 info.normal = float3(0, 0, 0);
+                info.density = 0;
                 return info;
             }
 
@@ -611,6 +613,34 @@ Shader "Custom/WorldPostProcess"
             }
 
 
+            // From: 
+            // https://blog.demofox.org/2017/01/09/raytracing-reflection-refraction-fresnel-total-internal-reflection-and-beers-law/?utm_source=chatgpt.com
+            float FresnelReflectAmount (float n1, float n2, float3 normal, float3 incident, float reflectivity)
+            {
+                // Schlick aproximation
+                float r0 = (n1-n2) / (n1+n2);
+                r0 *= r0;
+                float cosX = -dot(normal, incident);
+                if (n1 > n2)
+                {
+                    float n = n1/n2;
+                    float sinT2 = n*n*(1.0-cosX*cosX);
+                    // Total internal reflection
+                    if (sinT2 > 1.0)
+                        return 1.0;
+                    cosX = sqrt(1.0-sinT2);
+                }
+                float x = 1.0-cosX;
+                float ret = r0+(1.0-r0)*x*x*x*x*x;
+
+                // adjust reflect multiplier for object reflectivity
+                ret = (reflectivity + (1.0-reflectivity) * ret);
+                return ret;
+            }
+
+
+            // Todo: implement beer's law
+            // https://blog.demofox.org/2017/01/09/raytracing-reflection-refraction-fresnel-total-internal-reflection-and-beers-law/?utm_source=chatgpt.com
             rayMarchInfo rayMarchWorld(float3 startPos, float3 rayDir, int loopCount = 0)
             {
                 rayDir = normalize(rayDir);
@@ -666,35 +696,44 @@ Shader "Custom/WorldPostProcess"
 
                     if (refraction)
                     {
-                        //normal = adjustGlassNormal(rayPos, normal);
+                        normal = adjustGlassNormal(rayPos, normal);
 
-                        // Refract ray
+                        float glass_density = 100.2;
+                        if (last_medium == 1) res.density += dstTravelled_this_bounce * glass_density;
+
+                        // Init a new bounce
+                        bouncePos += rayDir * dstTravelled_this_bounce;
+                        dstTravelled_total += dstTravelled_this_bounce;
+                        dstTravelled_this_bounce = 0;
+
+                        // Determine IOR
                         float air_ratio = 1.0;
                         float glass_ratio = 1.2;
+                        float insideIOR = (last_medium == 0) ? air_ratio : glass_ratio;
+                        float outsideIOR = (last_medium == 0) ? glass_ratio : air_ratio;
 
-                        float eta = last_medium == 0 ? air_ratio / glass_ratio : glass_ratio / air_ratio;
-                        float3 newRayDir = refract(rayDir, normal, eta);
-                        
-                        if (length(newRayDir) == 0.0)
+                        // Compute Fresnel
+                        float reflectMultiplier = FresnelReflectAmount(insideIOR, outsideIOR, normal, rayDir, 0.01);
+                        float refractMultiplier = 1.0 - reflectMultiplier;
+
+                        // Refract and Reflect
+                        float eta = insideIOR / outsideIOR;
+                        float3 refractedRay = refract(rayDir, normal, eta);
+                        float3 reflectedRay = reflect(rayDir, normal);
+
+                        // Handle Total Internal Reflection (TIR)
+                        if (length(refractedRay) == 0.0)
                         {
-                            // Total internal reflection; use reflection instead
-                            rayDir = reflect(rayDir, normal);
-                            internal_reflection = true;
+                            rayDir = reflectedRay;
                         }
                         else
                         {
-                            rayDir = newRayDir;
+                            // Mix based on Fresnel
+                            rayDir = normalize(reflectedRay * reflectMultiplier + refractedRay * refractMultiplier);
                         }
-                        rayDir = normalize(rayDir);
 
                         // Reset DDA
-                        dda = resetDDA(rayDir, rayPos);
-
-                        // Init a new bounce
-                        bouncePos = bouncePos + rayDir * (dstTravelled_this_bounce);
-                        bouncePos = rayPos;
-                        dstTravelled_total += dstTravelled_this_bounce;
-                        dstTravelled_this_bounce = 0;
+                        dda = resetDDA(rayDir, bouncePos);
                     }
                     if (!internal_reflection)
                     {
@@ -760,6 +799,7 @@ Shader "Custom/WorldPostProcess"
                 uint block = round(tex2D(_BlockTexture, i.uv).r);
                 bool isBackground = block == 0;
                 float4 worldColor = getBlockColor(block, pos, normal);// * getOutline(pos);
+                float refraction_transmittance = 1;
 
                 // Handle refractions
                 if (block == 3)
@@ -774,7 +814,8 @@ Shader "Custom/WorldPostProcess"
                     if (block != 0)
                     {
                         worldColor = getBlockColor(refraction.blockID, refraction.pos, refraction.normal);
-                        //worldColor *= 0.5;
+                        // Apply beer's law.
+                        refraction_transmittance = saturate(exp(-refraction.density * 0.00025));
                     }
                 }
 
@@ -788,7 +829,6 @@ Shader "Custom/WorldPostProcess"
                 float lightShaft = getLightShaft(rayPos, rayDir, lightDir, depth, offset);
                 float lightShaftTimeMultiplier = saturate(dot(float3(0, 1, 0), lightDir)) * 2;
                 lightShaft *= lightShaftTimeMultiplier;
-                lightShaft = 0;
                 if (isBackground)
                 {
                     // Render object with lighting
@@ -811,7 +851,11 @@ Shader "Custom/WorldPostProcess"
                 }
 
                 float lightIntensity = computeLighting(pos, normal, lightDir, false);
-                return applyFog(float4((worldColor.rgb) * lightIntensity + lightShaft, worldColor.a), fog, fogColor);
+                worldColor = float4(worldColor.rgb * lightIntensity, worldColor.a);
+                
+                float4 glassColor = float4(52.9, 80.8, 92.2, 0) / 100.0;
+                worldColor = lerp(glassColor, worldColor, refraction_transmittance);
+                return applyFog(float4(worldColor + lightShaft), fog, fogColor);
             }
 
             ENDCG

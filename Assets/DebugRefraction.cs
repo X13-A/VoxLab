@@ -163,9 +163,13 @@ public class DebugRefraction : MonoBehaviour, IEventHandler
 
     public RayMarchInfo RayMarchWorld(Vector3 startPos, Vector3 rayDir)
     {
+        rayDir = rayDir.normalized;
+
+        // Perform initial world hit check
         var (dstToWorld, dstInsideWorld) = RayWorldHit(startPos, rayDir);
         RayMarchInfo result = RayMarchInfo.CreateDefault();
 
+        // EXIT EARLY
         if (dstInsideWorld <= 0)
         {
             result.Depth = float.MaxValue;
@@ -173,7 +177,7 @@ public class DebugRefraction : MonoBehaviour, IEventHandler
         }
         if (dstToWorld > 0)
         {
-            startPos += rayDir * dstToWorld;
+            startPos += rayDir * dstToWorld; // Start at intersection point
         }
 
         // Init DDA
@@ -181,61 +185,59 @@ public class DebugRefraction : MonoBehaviour, IEventHandler
         Vector3Int voxelIndex;
         (tMax, tDelta, step, voxelIndex) = ResetDDA(rayDir, startPos);
 
-        float dstLimit = Mathf.Min(VoxelRenderDistance - dstToWorld, dstInsideWorld);
+        float dstLimit = Mathf.Min(VoxelRenderDistance - dstToWorld, dstInsideWorld + 50); // Adjust for edge issues
         float dstTravelled_total = 0;
-        float dstTravelled_this_bounce = dstTravelled_total;
+        float dstTravelled_this_bounce = 0;
 
-        int loopCount = 0;
         int hardLoopLimit = (int)dstLimit * 2;
         int last_medium = 0;
+
         Vector3 tMax_old = tMax;
-        Vector3 rayPos = startPos;
+        Vector3 bouncePos = startPos;
+
+        int loopCount = 0;
         Vector3 rayPos_old = startPos;
-        Vector3 bouncePos = rayPos;
 
         while (loopCount++ < hardLoopLimit && dstTravelled_total < dstLimit)
         {
             Vector3 normal = -GetNormal(tMax_old, step);
 
-            float epsilon = 0.001f;
-            rayPos = bouncePos + (rayDir * dstTravelled_this_bounce) - normal * epsilon;
+            // Check current position
+            float epsilon = 0.0001f;
+            Vector3 rayPos = bouncePos + (rayDir * dstTravelled_this_bounce) - normal * epsilon;
             uint blockID = SampleWorld(rayPos);
 
-            // Get current medium
-            int medium = 0;
-            if (blockID == 3)
-            {
-                medium = 1;
-            }
-
+            // Determine current medium
+            int medium = blockID == 3 ? 1 : 0;
             bool refraction = medium != last_medium;
+            bool internal_reflection = false;
+
             if (refraction)
             {
-                //if (medium == 0) normal *= -1;
-
                 Gizmos.color = Color.red;
                 Gizmos.DrawLine(rayPos, rayPos + normal.normalized);
 
-                // Refract ray
+                // Init a new bounce
+                bouncePos += rayDir * dstTravelled_this_bounce;
+                dstTravelled_total += dstTravelled_this_bounce;
+                dstTravelled_this_bounce = 0;
+
+                // Perform refraction
                 float eta = last_medium == 0 ? air_ratio / glass_ratio : glass_ratio / air_ratio;
                 Vector3 newRayDir = Refract(rayDir.normalized, normal.normalized, eta);
-                if (newRayDir.magnitude == 0.0)
+
+                if (newRayDir.magnitude == 0.0f)
                 {
                     rayDir = Vector3.Reflect(rayDir, normal); // Total internal reflection
+                    internal_reflection = true;
                 }
                 else
                 {
-                    rayDir = newRayDir;
+                    rayDir = newRayDir.normalized;
                 }
-                rayDir = rayDir.normalized;
 
                 // Reset DDA
-                (tMax, tDelta, step, voxelIndex) = ResetDDA(rayDir, rayPos);
-
-                // Init a new bounce
-                bouncePos = rayPos;
-                dstTravelled_total += dstTravelled_this_bounce;
-                dstTravelled_this_bounce = 0;
+                (tMax, tDelta, step, voxelIndex) = ResetDDA(rayDir, bouncePos);
             }
 
             // Draw gizmos
@@ -244,24 +246,27 @@ public class DebugRefraction : MonoBehaviour, IEventHandler
             Gizmos.DrawSphere(rayPos, gizmoSize);
             Gizmos.DrawLine(rayPos, rayPos_old);
 
-            last_medium = medium;
+            if (!internal_reflection)
+            {
+                last_medium = medium;
+            }
             rayPos_old = rayPos;
 
-            // Collide with blocks
+            // Check for block hit
             if (blockID > 0 && medium != 1)
             {
                 result.BlockID = (int)blockID;
                 result.Complexity = loopCount;
-                result.Depth = dstToWorld + dstTravelled_total;
-                result.Normal = -GetNormal(tMax, step);
+                result.Depth = dstToWorld + dstTravelled_total; // Note: depth may be incorrect if refracted
+                result.Normal = normal;
                 result.Position = rayPos;
                 return result;
             }
 
             if (refraction) continue;
-
             tMax_old = tMax;
-            // Update DDA
+
+            // Move to the next voxel
             if (tMax.x < tMax.y && tMax.x < tMax.z)
             {
                 dstTravelled_this_bounce = tMax.x;

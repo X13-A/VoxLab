@@ -482,7 +482,7 @@ MonoBehaviour:
   WorldTextureSize: {x: 128, y: 128, z: 128}
   VoxelRenderDistance: 100
   air_ratio: 1
-  glass_ratio: 1
+  glass_ratio: 1.2
 --- !u!1 &354063116
 GameObject:
   m_ObjectHideFlags: 0
